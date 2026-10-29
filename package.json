@@ -4,6 +4,8 @@
   },
   "scripts": {
     "start": "node server.js",
-    "test": "node --test"
+    "test": "node --test",
+    "lint": "node --check server.js && node --check tests/health.test.js",
+    "audit": "npm audit --audit-level=high"
   }
 }

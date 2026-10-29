@@ -31,6 +31,12 @@ jobs:
       - name: Run tests
         run: npm test
 
+      - name: Check JavaScript syntax
+        run: npm run lint
+
+      - name: Audit production dependencies
+        run: npm run audit
+
       - name: Set lowercase image name
         id: image
         shell: bash
@@ -139,6 +145,11 @@ jobs:
 
           sudo docker pull "$IMAGE"
 
+          previous_image="$(sudo docker inspect --format '{{.Config.Image}}' cloudops-app 2>/dev/null || true)"
+          if [ -n "$previous_image" ]; then
+            printf '%s\n' "$previous_image" > /tmp/cloudops-previous-image
+          fi
+
           # Replace the old container only after the new image pulls.
           sudo docker rm -f cloudops-app 2>/dev/null || true
 
@@ -146,6 +157,11 @@ jobs:
             --name cloudops-app \
             --restart unless-stopped \
             -p 80:3000 \
+            --log-driver awslogs \
+            --log-opt awslogs-region=ap-south-1 \
+            --log-opt awslogs-group=/cloudops/application \
+            --log-opt awslogs-stream=cloudops-app \
+            -e APP_VERSION="${IMAGE##*:}" \
             "$IMAGE"
 
           # Wait for the application to become healthy.
@@ -160,6 +176,26 @@ jobs:
 
           echo "Health check failed. Recent container logs:"
           sudo docker logs --tail 100 cloudops-app || true
+          if [ -s /tmp/cloudops-previous-image ]; then
+            rollback_image="$(cat /tmp/cloudops-previous-image)"
+            echo "Rolling back to $rollback_image."
+            sudo docker pull "$rollback_image"
+            sudo docker rm -f cloudops-app 2>/dev/null || true
+            sudo docker run -d \
+              --name cloudops-app \
+              --restart unless-stopped \
+              -p 80:3000 \
+              --log-driver awslogs \
+              --log-opt awslogs-region=ap-south-1 \
+              --log-opt awslogs-group=/cloudops/application \
+              --log-opt awslogs-stream=cloudops-app \
+              -e APP_VERSION="${rollback_image##*:}" \
+              "$rollback_image"
+            if ! curl --fail --silent http://127.0.0.1/health >/dev/null; then
+              echo "Rollback container failed its health check."
+              sudo docker logs --tail 100 cloudops-app || true
+            fi
+          fi
           exit 1
           REMOTE
 

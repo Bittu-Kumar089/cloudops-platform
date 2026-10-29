@@ -1,3 +1,4 @@
+
 name: CloudOps CI-CD
 
 on:
@@ -47,7 +48,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build Docker image
+      - name: Build Docker image for testing
         if: github.event_name != 'push' || github.ref != 'refs/heads/main'
         uses: docker/build-push-action@v6
         with:
@@ -64,3 +65,64 @@ jobs:
           tags: |
             ${{ steps.image.outputs.name }}:${{ github.sha }}
             ${{ steps.image.outputs.name }}:latest
+
+      - name: Load SSH private key
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.EC2_SSH_KEY }}
+
+      - name: Configure SSH host verification
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        shell: bash
+        env:
+          EC2_KNOWN_HOSTS: ${{ secrets.EC2_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.ssh"
+          chmod 700 "$HOME/.ssh"
+          printf '%s\n' "$EC2_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+          test -s "$HOME/.ssh/known_hosts"
+
+      - name: Deploy to EC2
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        shell: bash
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          IMAGE: ${{ steps.image.outputs.name }}:${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          ssh \
+            -o BatchMode=yes \
+            -o StrictHostKeyChecking=yes \
+            "ubuntu@$EC2_HOST" \
+            "IMAGE='$IMAGE' bash -s" <<'REMOTE'
+          set -euo pipefail
+
+          sudo docker pull "$IMAGE"
+
+          # Replace the old container only after the new image pulls.
+          sudo docker rm -f cloudops-app 2>/dev/null || true
+
+          sudo docker run -d \
+            --name cloudops-app \
+            --restart unless-stopped \
+            -p 80:3000 \
+            "$IMAGE"
+
+          # Wait for the application to become healthy.
+          for attempt in $(seq 1 12); do
+            if curl --fail --silent http://127.0.0.1/health; then
+              echo
+              echo "Deployment health check passed."
+              exit 0
+            fi
+            sleep 5
+          done
+
+          echo "Health check failed. Recent container logs:"
+          sudo docker logs --tail 100 cloudops-app || true
+          exit 1
+          REMOTE
